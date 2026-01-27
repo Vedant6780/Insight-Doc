@@ -1,0 +1,13 @@
+pip==24.3.1
+langchain
+langchain-community
+streamlit
+streamlit-chat
+requests
+faiss-cpu
+sentence-transformers
+pypdf
+huggingface_hub
+python-dotenv
+groq
+toml
