@@ -1,0 +1,19 @@
+# Environment variables
+.env
+
+# Virtual environments
+.venv
+.venv_clean/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# IDE settings
+.vscode/
+.idea/
+
+# Streamlit
+.streamlit/

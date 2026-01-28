@@ -1,12 +1,31 @@
 import streamlit as st
 from streamlit_chat import message
-from langchain.chains import ConversationalRetrievalChain
+try:
+    from langchain.chains import create_retrieval_chain, create_history_aware_retriever
+    from langchain.chains.combine_documents import create_stuff_documents_chain
+except ImportError:
+    from langchain_classic.chains import create_retrieval_chain, create_history_aware_retriever
+    # Try importing logic for StuffDocumentsChain, usually in combine_documents
+    from langchain_classic.chains.combine_documents.stuff import StuffDocumentsChain
+    # Manual shim if create_stuff_documents_chain is missing in classic
+    def create_stuff_documents_chain(llm, prompt):
+        from langchain_classic.chains.llm import LLMChain
+        llm_chain = LLMChain(llm=llm, prompt=prompt)
+        return StuffDocumentsChain(
+            llm_chain=llm_chain, 
+            document_variable_name="context",
+            input_key="context"
+        )
+
 from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_huggingface import HuggingFaceEndpoint
+# from langchain_huggingface import HuggingFaceEndpoint # Switched to Groq
+from langchain_groq import ChatGroq
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS
-from langchain.memory import ConversationBufferMemory
+from langchain_community.vectorstores import FAISS # Updated location
+# from langchain.memory import ConversationBufferMemory # Deprecated usage
 from langchain_community.document_loaders import PyPDFLoader
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import HumanMessage, AIMessage
 from groq import Groq
 import os
 import tempfile
@@ -239,9 +258,18 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # API Keys and Model Configurations
-HUGGINGFACE_API_KEY = st.secrets["HUGGINGFACE_API_KEY"]
-GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
-MODEL_NAME = "mistralai/Mistral-7B-Instruct-v0.3"
+HUGGINGFACE_API_KEY = os.getenv("HUGGINGFACE_API_KEY") or st.secrets.get("HUGGINGFACE_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY") or st.secrets.get("GROQ_API_KEY")
+
+if not HUGGINGFACE_API_KEY:
+    st.error("HUGGINGFACE_API_KEY not found! Please check your .env file or Streamlit secrets.")
+    st.stop()
+
+if not GROQ_API_KEY:
+    st.error("GROQ_API_KEY not found! Please check your .env file or Streamlit secrets.")
+    st.stop()
+
+MODEL_NAME = "mistralai/Mistral-7B-Instruct-v0.2"
 
 # Initialize Groq client
 groq_client = Groq(api_key=GROQ_API_KEY)
@@ -319,7 +347,7 @@ def display_introduction():
                     use_container_width=True
                 )
             except FileNotFoundError:
-                st.caption(f"{file_name}\n(Not found)")
+                st.caption(f"{file_name} (Not found)")
 
 # Part 1: Text Processing
 def process_text_with_groq(task, text):
@@ -391,39 +419,87 @@ def display_text_processing():
 
 # Part 2: Document Search
 def create_conversational_chain(vector_store):
-    llm = HuggingFaceEndpoint(
-        repo_id=MODEL_NAME,
-        task="text-generation",
-        max_new_tokens=1024,
-        do_sample=False,
-        temperature=0.75,
-        top_p=0.9,
-        huggingfacehub_api_token=HUGGINGFACE_API_KEY
+    llm = ChatGroq(
+        api_key=GROQ_API_KEY,
+        model_name="llama-3.3-70b-versatile",
+        temperature=0.3
     )
-    memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
-    chain = ConversationalRetrievalChain.from_llm(
-        llm=llm, 
-        chain_type='stuff',
-        retriever=vector_store.as_retriever(search_kwargs={"k": 2}),
-        memory=memory
+    
+    retriever = vector_store.as_retriever(search_kwargs={"k": 2})
+
+    # 1. Contextualize question (History Aware Retriever)
+    contextualize_q_system_prompt = (
+        "Given a chat history and the latest user question "
+        "which might reference context in the chat history, "
+        "formulate a standalone question which can be understood "
+        "without the chat history. Do NOT answer the question, "
+        "just reformulate it if needed and otherwise return it as is."
     )
-    return chain
+    contextualize_q_prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", contextualize_q_system_prompt),
+            MessagesPlaceholder("chat_history"),
+            ("human", "{input}"),
+        ]
+    )
+    history_aware_retriever = create_history_aware_retriever(
+        llm, retriever, contextualize_q_prompt
+    )
+
+    # 2. Answer question (QA Chain)
+    system_prompt = (
+        "You are an assistant for question-answering tasks. "
+        "Use the following pieces of retrieved context to answer "
+        "the question. If you don't know the answer, say that you "
+        "don't know. Use three sentences maximum and keep the "
+        "answer concise."
+        "\n\n"
+        "{context}"
+    )
+    qa_prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", system_prompt),
+            MessagesPlaceholder("chat_history"),
+            ("human", "{input}"),
+        ]
+    )
+    question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
+    
+    # 3. Final Retrieval Chain
+    rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
+    return rag_chain
 
 def conversation_chat(query, chain, history):
-    result = chain({"question": query, "chat_history": history})
-    full_answer = result["answer"].strip()
+    # Convert list of tuples to list of BaseMessages for LangChain
+    chat_history = []
+    for past_q, past_a in history:
+        chat_history.append(HumanMessage(content=past_q))
+        chat_history.append(AIMessage(content=past_a))
 
-    if "Question:" in full_answer:
-        question_start = full_answer.find("Question:")
-        cropped_answer = full_answer[question_start:]
+    result = chain.invoke({"input": query, "chat_history": chat_history})
+    
+    answer = result["answer"]
+    if hasattr(answer, "content"):
+        full_answer = answer.content.strip()
+    elif isinstance(answer, str):
+        full_answer = answer.strip()
     else:
-        cropped_answer = "The response does not contain a clearly defined question and answer."
+        full_answer = str(answer).strip()
+    
+    # Post-processing logic (cleaned up)
+    # Post-processing logic (cleaned up)
+    cropped_answer = full_answer
 
+    # Basic cleanup
     if "I don't know" in cropped_answer or not cropped_answer.strip():
-        cropped_answer = f"The provided context does not provide information on '{query}'."
+         # Fallback check
+         pass 
 
-    history.append((query, cropped_answer))
-    return cropped_answer, full_answer, result.get("source_documents", [])
+    # Update history (Streamlit session state is updated in the calling loop usually, 
+    # but here we just return the answer to append)
+    # history.append((query, cropped_answer)) # Not needed if we reconstruct history from state every time
+    
+    return full_answer, full_answer, result.get("context", [])
 
 def display_document_search(chain):
     st.markdown("### 🔍 Ask Your Documents")
@@ -455,6 +531,9 @@ def display_document_search(chain):
                     st.markdown(f"**Source {i+1}:**")
                     st.write(doc.page_content)
                     st.markdown("---")
+        
+        # Append to history for next turn
+        st.session_state['history'].append((user_input, cropped_output))
     elif submit_button and not user_input:
         st.warning("⚠️ Please enter a question.")
 
